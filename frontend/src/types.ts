@@ -1,0 +1,9 @@
+export type Item={id:number;title:string;description?:string|null;completed:boolean;list_id?:number|null;plan_id?:number|null;parent_id?:number|null;priority?:string|null;due_date?:string|null;start_date?:string|null;estimated_minutes?:number|null;acceptance_criteria?:string|null;notes?:string|null;source?:string|null;position:number;tags:string[];metadata:Record<string,unknown>;created_at:string;updated_at:string}
+export type List={id:number;name:string;description?:string|null;plan_id?:number|null;color?:string|null;position:number;item_count:number;pending_count:number}
+export type Plan={id:number;title:string;description?:string|null;date?:string|null;content_type:string;status:string;created_at:string}
+export type ParsedItem={title:string;description?:string|null;priority?:string|null;due_date?:string|null;estimated_minutes?:number|null;acceptance_criteria?:string|null;notes?:string|null;tags:string[];steps:string[];subtasks:ParsedItem[];conditional_actions:Record<string,unknown>[];dependencies:string[];source_excerpt?:string|null;assignee_role?:string|null;metadata:Record<string,unknown>;duplicate:boolean}
+export type ParsedList={name:string;description?:string|null;items:ParsedItem[]}
+export type ParsedPlan={title:string;goal?:string|null;description?:string|null;content_type:string;date?:string|null;lists:ParsedList[];confidence:number;parser:string;provider?:string|null;model?:string|null;granularity:'compact'|'balanced'|'detailed';task_count:number;step_count:number;warnings:string[];duplicate_count:number}
+export type ActorOption={name:string;description:string;evidence:string[];estimated_task_count:number;is_general:boolean}
+export type ActorAnalysis={actors:ActorOption[];summary:string;warnings:string[];provider?:string|null;model?:string|null}
+export type View='inbox'|'today'|'upcoming'|'all'|'history'|'import'|'settings'|`list-${number}`

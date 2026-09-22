@@ -1,0 +1,2 @@
+"""AI Checklist Hub backend."""
+

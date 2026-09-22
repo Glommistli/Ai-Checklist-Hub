@@ -1,0 +1,34 @@
+.venv/
+node_modules/
+frontend/dist/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Local databases and their SQLite sidecar files
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Python caches and test output
+__pycache__/
+.pytest_cache/
+*.pyc
+.coverage
+htmlcov/
+
+# Frontend/build caches
+*.tsbuildinfo
+build/
+desktop_dist/
+*.spec
+
+# Local logs and editor/OS metadata
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
