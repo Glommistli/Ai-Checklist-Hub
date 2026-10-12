@@ -50,7 +50,8 @@ def confirm_parsed_plan(data: ImportConfirmRequest, db: Session) -> dict:
 
         def persist_item(parsed_item, item_pos: int, parent_id: int | None = None):
             nonlocal created, skipped
-            fp = fingerprint_for(parsed_item.title, lst.name, plan.title, data.external_id, plan.date)
+            fingerprint_date = parsed_item.due_date or parsed_item.start_date or plan.date
+            fp = fingerprint_for(parsed_item.title, lst.name, plan.title, data.external_id, fingerprint_date)
             exists = db.scalar(select(Item.id).where(Item.fingerprint == fp)) is not None
             if exists and data.duplicate_strategy == "skip":
                 skipped += 1
@@ -71,6 +72,7 @@ def confirm_parsed_plan(data: ImportConfirmRequest, db: Session) -> dict:
                 description=parsed_item.description,
                 priority=parsed_item.priority,
                 due_date=parsed_item.due_date,
+                start_date=parsed_item.start_date,
                 estimated_minutes=parsed_item.estimated_minutes,
                 acceptance_criteria=parsed_item.acceptance_criteria,
                 notes=parsed_item.notes,

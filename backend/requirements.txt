@@ -7,4 +7,8 @@ httpx==0.28.1
 python-multipart==0.0.20
 alembic==1.15.2
 pytest==8.3.5
-
+pypdf==6.1.1
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl==3.1.5
+charset-normalizer==3.4.3

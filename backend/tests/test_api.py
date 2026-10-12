@@ -1,3 +1,6 @@
+from app.models import Checklist, Item
+
+
 def test_list_and_item_crud(client):
     lst = client.post("/api/lists", json={"name":"Work","metadata":{}})
     assert lst.status_code == 201
@@ -5,12 +8,40 @@ def test_list_and_item_crud(client):
     item = client.post("/api/items", json={"title":"Fix API bug","list_id":list_id,"tags":["bug"],"metadata":{}})
     assert item.status_code == 201
     item_id = item.json()["id"]
-    assert client.put(f"/api/items/{item_id}", json={"notes":"Reproduce first"}).json()["notes"] == "Reproduce first"
+    edited = client.put(f"/api/items/{item_id}", json={
+        "notes": "Reproduce first", "start_date": "2026-10-01",
+        "due_date": "2026-10-03", "estimated_minutes": 150,
+    }).json()
+    assert edited["notes"] == "Reproduce first"
+    assert edited["start_date"] == "2026-10-01"
+    assert edited["due_date"] == "2026-10-03"
+    assert edited["estimated_minutes"] == 150
     assert client.post(f"/api/items/{item_id}/complete").json()["completed"] is True
     assert client.post(f"/api/items/{item_id}/complete").json()["completed"] is False
     assert len(client.get("/api/items", params={"q":"API"}).json()) == 1
     assert client.delete(f"/api/items/{item_id}").status_code == 204
     assert client.delete(f"/api/lists/{list_id}").status_code == 204
+
+
+def test_item_pagination_keeps_large_imported_lists_visible(client, db):
+    imported = Checklist(name="大型自动规划")
+    db.add(imported)
+    db.flush()
+    db.add_all([
+        Item(title=f"自动任务 {index + 1}", list_id=imported.id, position=index, metadata_={})
+        for index in range(1205)
+    ])
+    db.commit()
+
+    first = client.get("/api/items", params={"limit": 1000, "offset": 0})
+    second = client.get("/api/items", params={"limit": 1000, "offset": 1000})
+    assert first.status_code == 200
+    assert second.status_code == 200
+    combined = first.json() + second.json()
+    assert len(first.json()) == 1000
+    assert len(second.json()) == 205
+    assert len({item["id"] for item in combined}) == 1205
+    assert {item["list_id"] for item in combined} == {imported.id}
 
 
 def test_plan_crud(client):
@@ -128,6 +159,22 @@ def test_force_llm_calls_enabled_provider_for_structured_text(client, monkeypatc
     assert calls == ["清晰清单：\n- 第一项\n- 第二项"]
     assert response.json()["parser"] == "agent_v2"
     assert response.json()["lists"][0]["items"][0]["title"] == "AI 任务"
+
+
+def test_duplicate_provider_returns_clear_conflict(client):
+    payload = {
+        "name": "DeepSeek", "base_url": "https://api.deepseek.com",
+        "model": "deepseek-flash", "enabled": True,
+    }
+    first = client.post("/api/settings/providers", json=payload)
+    assert first.status_code == 201, first.text
+
+    duplicate = client.post("/api/settings/providers", json={**payload, "name": "  deepseek  "})
+    assert duplicate.status_code == 409, duplicate.text
+    assert "已存在" in duplicate.json()["detail"]
+    providers = client.get("/api/settings/providers").json()
+    assert len(providers) == 1
+    assert providers[0]["enabled"] is True
 
 
 def test_force_llm_reports_missing_provider(client):

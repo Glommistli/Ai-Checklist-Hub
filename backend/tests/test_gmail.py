@@ -66,7 +66,8 @@ def test_rules_exclude_otp_and_promotions():
     assert promotion and promotion.category == "advertisement" and promotion.confidence == 0.99
 
 
-def test_processing_ledger_prevents_body_download_and_import_twice(db):
+def test_processing_ledger_prevents_body_download_and_import_twice(db, monkeypatch):
+    mock_model(monkeypatch)
     message = payload("m-1", "提交报名材料", "请于2026年9月25日前完成并提交报名材料。")
     client = FakeGmailClient({"m-1": message})
     settings = {"auto_import": True, "auto_import_threshold": 0.9}
@@ -98,6 +99,7 @@ def test_uncertain_email_becomes_candidate_without_creating_task(db):
 
 
 def test_sync_switches_from_bounded_initial_scan_to_history_cursor(db, monkeypatch):
+    mock_model(monkeypatch)
     from app.services import gmail_service
 
     client = FakeIncrementalClient({
@@ -124,3 +126,11 @@ def test_old_minute_interval_is_migrated_to_hours(db):
     db.commit()
 
     assert gmail_state(db)["sync_interval_hours"] == 2
+
+
+def mock_model(monkeypatch):
+    from app.services import gmail_service
+    from app.schemas import ParsedPlan, ParsedList, ParsedItem
+    monkeypatch.setattr(gmail_service, "_plan_for_email", lambda db, account, message: ParsedPlan(
+        title="邮件报名", parser="gmail_llm", provider="Mock", model="mock", confidence=0.94,
+        lists=[ParsedList(name="邮件任务", items=[ParsedItem(title="提交报名材料")])]))

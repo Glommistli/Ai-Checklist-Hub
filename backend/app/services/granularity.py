@@ -122,8 +122,9 @@ def _promote_explicit_subtasks(item: ParsedItem) -> None:
 def _normalize_item(item: ParsedItem, options: AgentOptions) -> ParsedItem:
     item.title = item.title.strip()
     item.steps = _clean_texts(item.steps)
-    _absorb_low_value_steps(item)
-    _promote_explicit_subtasks(item)
+    if options.granularity != "auto":
+        _absorb_low_value_steps(item)
+        _promote_explicit_subtasks(item)
     item.dependencies = _clean_texts(item.dependencies)
     normalized_conditions: list[dict] = []
     for entry in item.conditional_actions:
@@ -137,7 +138,7 @@ def _normalize_item(item: ParsedItem, options: AgentOptions) -> ParsedItem:
     item.subtasks = [_normalize_item(child, options) for child in item.subtasks if child.title.strip()]
     if options.granularity == "compact":
         _apply_compact_shape(item)
-    if options.steps_as_subtasks and item.steps:
+    if options.granularity != "auto" and options.steps_as_subtasks and item.steps:
         existing = {child.title for child in item.subtasks}
         item.subtasks.extend(ParsedItem(title=step) for step in item.steps if step not in existing)
         item.steps = []
@@ -164,14 +165,17 @@ def _filter_other_roles(plan: ParsedPlan, options: AgentOptions) -> None:
     if not options.only_user_actions:
         return
     removed_roles: set[str] = set()
-    for task_list in plan.lists:
-        kept: list[ParsedItem] = []
-        for item in task_list.items:
+    def keep_items(items: list[ParsedItem]) -> list[ParsedItem]:
+        kept = []
+        for item in items:
             if _role_matches_user(item.assignee_role, options.user_context):
+                item.subtasks = keep_items(item.subtasks)
                 kept.append(item)
             else:
                 removed_roles.add(item.assignee_role or "其他角色")
-        task_list.items = kept
+        return kept
+    for task_list in plan.lists:
+        task_list.items = keep_items(task_list.items)
     plan.lists = [task_list for task_list in plan.lists if task_list.items]
     if removed_roles:
         roles = "、".join(sorted(removed_roles))
@@ -221,8 +225,9 @@ def normalize_plan(plan: ParsedPlan, options: AgentOptions) -> ParsedPlan:
     for task_list in plan.lists:
         task_list.items = [_normalize_item(item, options) for item in task_list.items if item.title.strip()]
     _filter_other_roles(plan, options)
-    _absorb_conditionals(plan)
-    _condense_to_limit(plan, options.max_top_level_tasks)
+    if options.granularity != "auto":
+        _absorb_conditionals(plan)
+        _condense_to_limit(plan, options.max_top_level_tasks)
     plan.task_count = sum(len(task_list.items) for task_list in plan.lists)
     plan.step_count = sum(
         len(item.steps) + len(item.subtasks)

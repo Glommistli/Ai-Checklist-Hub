@@ -48,6 +48,46 @@ class RawContent(Base, TimestampMixin):
     metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
 
 
+class ImportBatch(Base, TimestampMixin):
+    __tablename__ = "import_batches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_kind: Mapped[str] = mapped_column(String(30), default="files")
+    root_name: Mapped[str] = mapped_column(String(500), default="导入资料")
+    status: Mapped[str] = mapped_column(String(30), default="ready", index=True)
+    file_count: Mapped[int] = mapped_column(Integer, default=0)
+    supported_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_size: Mapped[int] = mapped_column(Integer, default=0)
+    total_media_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    documents: Mapped[list["ImportDocument"]] = relationship(back_populates="batch", cascade="all, delete-orphan")
+
+
+class ImportDocument(Base, TimestampMixin):
+    __tablename__ = "import_documents"
+    __table_args__ = (UniqueConstraint("batch_id", "relative_path", name="uq_import_document_batch_path"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("import_batches.id", ondelete="CASCADE"), index=True)
+    relative_path: Mapped[str] = mapped_column(String(1000))
+    filename: Mapped[str] = mapped_column(String(500))
+    extension: Mapped[str] = mapped_column(String(30), default="")
+    mime_type: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    extraction_status: Mapped[str] = mapped_column(String(30), default="ready")
+    extracted_text: Mapped[str] = mapped_column(Text, default="")
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    slide_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sheet_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sequence_hint: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    batch: Mapped[ImportBatch] = relationship(back_populates="documents")
+
+
 class EmailIngestion(Base, TimestampMixin):
     """Durable Gmail processing ledger.
 

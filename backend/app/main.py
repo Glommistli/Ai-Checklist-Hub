@@ -25,7 +25,7 @@ async def lifespan(_: FastAPI):
         stop_gmail_worker()
 
 
-app = FastAPI(title=settings.app_name, version="1.0.0", docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version="2.1.3", docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
 app.include_router(router)
 
 frontend = Path(__file__).resolve().parents[2] / "frontend" / "dist"

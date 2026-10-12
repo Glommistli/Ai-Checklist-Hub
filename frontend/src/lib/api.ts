@@ -4,4 +4,6 @@ export const api={
   post:<T>(url:string,data?:unknown)=>json<T>(url,{method:'POST',body:data===undefined?undefined:JSON.stringify(data)}),
   put:<T>(url:string,data:unknown)=>json<T>(url,{method:'PUT',body:JSON.stringify(data)}),
   delete:(url:string)=>json<void>(url,{method:'DELETE'})
+  ,form:async<T>(url:string,data:FormData):Promise<T>=>{const res=await fetch(url,{method:'POST',body:data});if(!res.ok){const body=await res.text();let message=body||`HTTP ${res.status}`;try{const parsed=JSON.parse(body);if(typeof parsed.detail==='string')message=parsed.detail}catch{}throw new Error(message)}return res.json()}
+  ,chunk:async<T>(url:string,data:Blob,signal?:AbortSignal):Promise<T>=>{const res=await fetch(url,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:data,signal});if(!res.ok){const body=await res.text();let message=body||`HTTP ${res.status}`;try{const parsed=JSON.parse(body);if(typeof parsed.detail==='string')message=parsed.detail}catch{}throw new Error(message)}return res.json()}
 }

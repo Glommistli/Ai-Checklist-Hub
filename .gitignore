@@ -24,6 +24,7 @@ htmlcov/
 *.tsbuildinfo
 build/
 desktop_dist/
+installer_dist/
 *.spec
 
 # Local logs and editor/OS metadata

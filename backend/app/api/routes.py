@@ -1,27 +1,39 @@
 from __future__ import annotations
+import hashlib
+import json
 import os
+import shutil
 from html import escape
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
-from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse
+from starlette.concurrency import run_in_threadpool
 import httpx
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from app.core.database import get_db
 from app.core.config import settings
 from app.core.secrets import delete_secret, get_secret, provider_secret_name, set_secret
-from app.models import AppPreference, Category, Checklist, EmailIngestion, Item, Plan, ProviderConfig
+from app.models import AppPreference, Category, Checklist, EmailIngestion, ImportBatch, ImportDocument, Item, Plan, ProviderConfig
 from app.schemas import (
     ActorAnalyzeRequest, GmailCandidateOut, GmailClientRequest, GmailSettingsUpdate,
     ImportConfirmRequest, ImportParseRequest, ItemCreate, ItemOut, ItemUpdate,
-    ListCreate, ListOut, ListUpdate, PlanCreate, PlanOut, PlanUpdate, UISettings,
+    ChunkedUploadInit, ImportBatchOut, PlanningConfirmRequest, PlanningOptions, ParsedItem, ParsedList, ParsedPlan,
+    ListCreate, ListOut, ListUpdate, PlanCreate, PlanOut, PlanUpdate, ProviderCreate, UISettings,
 )
 from app.services.parser import LLMProviderError, OpenAICompatibleProvider, analyze_actors, parse_content, provider_api_key
 from app.services.agent_parser import AgentOptions
-from app.services.repository import create_item, update_item
+from app.services.repository import create_item, update_item, delete_item_tree
 from app.services.importer import confirm_parsed_plan
+from app.services.document_import import (
+    MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MEDIA_EXTENSIONS, SUPPORTED_EXTENSIONS,
+    IgnoredRelativePathError, extract_document, extract_document_path, safe_relative_path,
+    sha256_bytes, sha256_path,
+)
+from app.services.planning import analyze_learning_units, build_schedule
 from app.services.gmail_service import (
     GmailError, accept_candidate, begin_oauth, client_configured, disconnect_gmail,
     finish_oauth, gmail_state, save_gmail_state, save_oauth_client, sync_gmail,
@@ -162,9 +174,14 @@ def list_items(
     db: Db, completed: bool | None = None, list_id: int | None = None,
     category_id: int | None = None, plan_id: int | None = None, priority: str | None = None,
     tag: str | None = None, due_from: date | None = None, due_to: date | None = None,
-    q: str | None = Query(default=None, max_length=200), limit: int = Query(500, le=1000),
+    q: str | None = Query(default=None, max_length=200), limit: int = Query(500, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
 ):
-    stmt = select(Item).options(selectinload(Item.tags)).order_by(Item.completed, Item.position, Item.created_at.desc()).limit(limit)
+    stmt = (
+        select(Item).options(selectinload(Item.tags))
+        .order_by(Item.completed, Item.position, Item.created_at.desc(), Item.id.desc())
+        .offset(offset).limit(limit)
+    )
     if completed is not None: stmt = stmt.where(Item.completed == completed)
     if list_id is not None: stmt = stmt.where(Item.list_id == list_id)
     if category_id is not None: stmt = stmt.where(Item.category_id == category_id)
@@ -191,7 +208,7 @@ def edit_item(item_id: int, data: ItemUpdate, db: Db): return update_item(db, ge
 
 
 @router.delete("/items/{item_id}", status_code=204)
-def delete_item(item_id: int, db: Db): db.delete(get_or_404(db, Item, item_id)); db.commit()
+def delete_item(item_id: int, db: Db): delete_item_tree(db, get_or_404(db, Item, item_id))
 
 
 @router.post("/items/{item_id}/complete", response_model=ItemOut)
@@ -290,6 +307,350 @@ async def parse_file(db: Db, file: UploadFile = File(...)):
     return parse_content(content, db)
 
 
+def _batch_payload(batch: ImportBatch, db: Session) -> dict:
+    documents = list(db.scalars(
+        select(ImportDocument).where(ImportDocument.batch_id == batch.id).order_by(ImportDocument.sequence_hint)
+    ))
+    return {
+        "id": batch.id, "source_kind": batch.source_kind, "root_name": batch.root_name,
+        "status": batch.status, "file_count": batch.file_count, "supported_count": batch.supported_count,
+        "skipped_count": batch.skipped_count, "error_count": batch.error_count,
+        "total_size": batch.total_size, "total_media_seconds": batch.total_media_seconds,
+        "documents": documents,
+    }
+
+
+LARGE_IMPORT_MAX_BYTES = 256 * 1024 * 1024 * 1024
+UPLOAD_CHUNK_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _upload_root() -> Path:
+    local = os.getenv("LOCALAPPDATA")
+    root = Path(local) / "AI Checklist Hub" / "upload-cache" if local else Path(settings.database_url.removeprefix("sqlite:///" )).resolve().parent / "upload-cache"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _batch_upload_dir(batch_id: int) -> Path:
+    return _upload_root() / str(batch_id)
+
+
+def _upload_part_path(batch_id: int, document_id: int) -> Path:
+    return _batch_upload_dir(batch_id) / f"{document_id}.part"
+
+
+def _remove_upload_cache(batch_id: int) -> None:
+    shutil.rmtree(_batch_upload_dir(batch_id), ignore_errors=True)
+
+
+@router.post("/import/uploads", response_model=ImportBatchOut, status_code=201)
+def start_chunked_upload(data: ChunkedUploadInit, db: Db):
+    """Create a resumable, bounded-memory import session.
+
+    Media with browser-readable duration is indexed by metadata and never copied.
+    Other supported files are marked for fixed-size chunk transfer.
+    """
+    prepared_files = []
+    for index, file in enumerate(data.files):
+        try:
+            relative_path = safe_relative_path(file.relative_path)
+            ignored = False
+        except IgnoredRelativePathError as exc:
+            relative_path = exc.relative_path
+            ignored = True
+        except ValueError as exc:
+            raise HTTPException(400, f"第 {index + 1} 个文件路径无效：{exc}") from exc
+        prepared_files.append((index, file, relative_path, ignored))
+
+    total_size = sum(file.size for _, file, _, _ in prepared_files)
+    if total_size > LARGE_IMPORT_MAX_BYTES:
+        raise HTTPException(413, "单次导入资料总大小不能超过 256 GB")
+    transfer_size = sum(
+        file.size for _, file, relative_path, ignored in prepared_files
+        if not ignored
+        and Path(relative_path).suffix.lower() in SUPPORTED_EXTENSIONS
+        and not (Path(relative_path).suffix.lower() in MEDIA_EXTENSIONS and file.duration_seconds)
+    )
+    free_space = shutil.disk_usage(_upload_root()).free
+    if transfer_size + 512 * 1024 * 1024 > free_space:
+        raise HTTPException(507, f"临时空间不足：需约 {transfer_size / 1024**3:.1f} GB，并保留 0.5 GB 安全空间")
+    batch = ImportBatch(
+        source_kind=data.source_kind, root_name=data.root_name.strip() or "导入资料",
+        status="uploading", file_count=len(data.files), total_size=total_size,
+    )
+    db.add(batch); db.flush()
+    seen_paths: set[str] = set()
+    supported = skipped = errors = media_seconds = 0
+    for index, file, relative_path, ignored in prepared_files:
+        suffix = Path(relative_path).suffix.lower()
+        if ignored:
+            skipped += 1
+            db.add(ImportDocument(
+                batch_id=batch.id, relative_path=relative_path, filename=Path(relative_path).name,
+                extension=suffix, mime_type=file.mime_type or None, size=file.size,
+                sha256=hashlib.sha256(f"ignored\0{relative_path}\0{file.size}".encode()).hexdigest(),
+                extraction_status="skipped", extracted_text="", duration_seconds=None,
+                sequence_hint=index, error_message="已自动跳过隐藏目录或开发目录中的文件",
+                metadata_={"upload_required": False, "ignored_path": True},
+            ))
+            continue
+        key = relative_path.casefold()
+        if key in seen_paths:
+            db.rollback()
+            raise HTTPException(409, f"目录中存在重复路径：{relative_path}")
+        seen_paths.add(key)
+        upload_required = suffix in SUPPORTED_EXTENSIONS
+        status, error, duration = "pending", None, file.duration_seconds
+        metadata = {
+            "upload_required": upload_required, "received": 0,
+            "declared_size": file.size, "last_modified": file.last_modified,
+        }
+        if suffix not in SUPPORTED_EXTENSIONS:
+            status, error, upload_required = "skipped", f"暂不支持 {suffix or '无扩展名'} 文件", False
+            metadata["upload_required"] = False
+            skipped += 1
+        elif suffix in MEDIA_EXTENSIONS and duration:
+            status, upload_required = "ready", False
+            metadata.update({"upload_required": False, "metadata_only": True, "media_type": "audio" if suffix in {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg"} else "video"})
+            supported += 1
+            media_seconds += duration
+        db.add(ImportDocument(
+            batch_id=batch.id, relative_path=relative_path, filename=Path(relative_path).name,
+            extension=suffix, mime_type=file.mime_type or None, size=file.size,
+            sha256=hashlib.sha256(f"{relative_path}\0{file.size}\0{file.last_modified or 0}".encode()).hexdigest() if not upload_required else "",
+            extraction_status=status, extracted_text="", duration_seconds=duration,
+            sequence_hint=index, error_message=error, metadata_=metadata,
+        ))
+    batch.supported_count, batch.skipped_count, batch.error_count = supported, skipped, errors
+    batch.total_media_seconds = media_seconds
+    db.commit(); db.refresh(batch)
+    return _batch_payload(batch, db)
+
+
+@router.put("/import/uploads/{batch_id}/{document_id}/chunk")
+async def upload_chunk(batch_id: int, document_id: int, request: Request, db: Db, offset: int = Query(ge=0)):
+    batch = get_or_404(db, ImportBatch, batch_id)
+    document = get_or_404(db, ImportDocument, document_id)
+    if document.batch_id != batch.id:
+        raise HTTPException(404, "上传文件不存在")
+    metadata = dict(document.metadata_ or {})
+    if not metadata.get("upload_required") or document.extraction_status != "pending":
+        raise HTTPException(409, "该文件不需要上传或已经处理")
+    part_path = _upload_part_path(batch.id, document.id)
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    received = part_path.stat().st_size if part_path.exists() else 0
+    content_length = request.headers.get("content-length")
+    declared_chunk_size = int(content_length) if content_length else None
+    if offset < received and declared_chunk_size and offset + declared_chunk_size <= received:
+        return {"received": received, "size": int(metadata.get("declared_size", document.size)), "replayed": True}
+    if offset != received:
+        raise HTTPException(409, f"上传偏移不一致，服务端已接收 {received} 字节")
+    declared_size = int(metadata.get("declared_size", document.size))
+    if received >= declared_size:
+        raise HTTPException(409, "文件内容已经上传完毕")
+    if declared_chunk_size and declared_chunk_size > UPLOAD_CHUNK_MAX_BYTES:
+        raise HTTPException(413, "单个分块不能超过 16 MB")
+    chunk_path = part_path.with_name(f"{document.id}.{offset}.chunk")
+    chunk_size = 0
+    try:
+        with chunk_path.open("wb") as chunk_file:
+            async for chunk in request.stream():
+                chunk_size += len(chunk)
+                if chunk_size > UPLOAD_CHUNK_MAX_BYTES:
+                    raise HTTPException(413, "单个分块不能超过 16 MB")
+                chunk_file.write(chunk)
+        if chunk_size <= 0 or received + chunk_size > declared_size:
+            raise HTTPException(400, "上传分块为空或超过声明的文件大小")
+        with part_path.open("ab") as destination, chunk_path.open("rb") as source:
+            shutil.copyfileobj(source, destination, length=1024 * 1024)
+    finally:
+        chunk_path.unlink(missing_ok=True)
+    received += chunk_size
+    metadata["received"] = received
+    document.metadata_ = metadata
+    db.commit()
+    return {"received": received, "size": declared_size}
+
+
+@router.post("/import/uploads/{batch_id}/{document_id}/complete")
+async def complete_uploaded_document(batch_id: int, document_id: int, db: Db):
+    batch = get_or_404(db, ImportBatch, batch_id)
+    document = get_or_404(db, ImportDocument, document_id)
+    if document.batch_id != batch.id:
+        raise HTTPException(404, "上传文件不存在")
+    metadata = dict(document.metadata_ or {})
+    part_path = _upload_part_path(batch.id, document.id)
+    expected = int(metadata.get("declared_size", document.size))
+    actual = part_path.stat().st_size if part_path.exists() else 0
+    if actual != expected:
+        raise HTTPException(409, f"文件尚未完整上传：{actual} / {expected} 字节")
+    try:
+        digest = await run_in_threadpool(sha256_path, part_path)
+        extracted = await run_in_threadpool(extract_document_path, document.relative_path, part_path)
+        document.sha256 = digest
+        document.extraction_status = extracted.status
+        document.extracted_text = extracted.text
+        document.page_count = extracted.page_count
+        document.slide_count = extracted.slide_count
+        document.sheet_count = extracted.sheet_count
+        document.duration_seconds = extracted.duration_seconds
+        document.error_message = extracted.error
+        metadata.update(extracted.metadata)
+        metadata.update({"upload_required": False, "received": actual})
+        document.metadata_ = metadata
+        db.commit()
+    finally:
+        part_path.unlink(missing_ok=True)
+    return {"id": document.id, "status": document.extraction_status}
+
+
+@router.post("/import/uploads/{batch_id}/complete", response_model=ImportBatchOut)
+def complete_chunked_upload(batch_id: int, db: Db):
+    batch = get_or_404(db, ImportBatch, batch_id)
+    documents = list(db.scalars(select(ImportDocument).where(ImportDocument.batch_id == batch.id)))
+    pending = [doc for doc in documents if doc.extraction_status == "pending"]
+    if pending:
+        raise HTTPException(409, f"仍有 {len(pending)} 个文件尚未处理完成")
+    batch.supported_count = sum(doc.extraction_status in {"ready", "warning"} for doc in documents)
+    batch.skipped_count = sum(doc.extraction_status == "skipped" for doc in documents)
+    batch.error_count = sum(doc.extraction_status == "error" for doc in documents)
+    batch.total_media_seconds = sum(doc.duration_seconds or 0 for doc in documents)
+    batch.content_hash = hashlib.sha256("".join(doc.sha256 for doc in documents).encode()).hexdigest()
+    batch.status = "ready" if batch.supported_count else "failed"
+    db.commit(); db.refresh(batch)
+    _remove_upload_cache(batch.id)
+    return _batch_payload(batch, db)
+
+
+@router.post("/import/batches", response_model=ImportBatchOut)
+async def create_import_batch(
+    db: Db,
+    files: list[UploadFile] = File(...),
+    root_name: str = Form("导入资料"),
+    source_kind: str = Form("files"),
+    relative_paths: str = Form("[]"),
+):
+    if not files or len(files) > MAX_FILES:
+        raise HTTPException(400, f"一次必须选择 1～{MAX_FILES} 个文件")
+    try:
+        paths = json.loads(relative_paths)
+        if not isinstance(paths, list):
+            raise ValueError
+    except (ValueError, json.JSONDecodeError):
+        raise HTTPException(400, "relative_paths 必须是 JSON 数组")
+    if paths and len(paths) != len(files):
+        raise HTTPException(400, "文件和相对路径数量不一致")
+    batch = ImportBatch(source_kind=source_kind[:30], root_name=(root_name.strip() or "导入资料")[:500], status="extracting")
+    db.add(batch); db.flush()
+    total_size = supported = skipped = errors = media_seconds = 0
+    hashes = []
+    for index, upload in enumerate(files):
+        raw_path = str(paths[index]) if paths else (upload.filename or f"file-{index + 1}")
+        try:
+            relative_path = safe_relative_path(raw_path)
+        except ValueError as exc:
+            skipped += 1
+            continue
+        data = await upload.read(MAX_FILE_BYTES + 1)
+        if len(data) > MAX_FILE_BYTES:
+            extracted_status, extracted_error = "error", "文件超过 100 MB 限制"
+            extracted = None
+        else:
+            extracted = extract_document(relative_path, data)
+            extracted_status, extracted_error = extracted.status, extracted.error
+        total_size += len(data)
+        if total_size > MAX_TOTAL_BYTES:
+            db.rollback()
+            raise HTTPException(413, "一次导入的文件总大小不能超过 2 GB")
+        digest = sha256_bytes(data)
+        hashes.append(digest)
+        if extracted_status == "skipped": skipped += 1
+        elif extracted_status == "error": errors += 1
+        else: supported += 1
+        if extracted and extracted.duration_seconds:
+            media_seconds += extracted.duration_seconds
+        db.add(ImportDocument(
+            batch_id=batch.id, relative_path=relative_path, filename=Path(relative_path).name,
+            extension=Path(relative_path).suffix.lower(), mime_type=upload.content_type, size=len(data), sha256=digest,
+            extraction_status=extracted_status, extracted_text=extracted.text if extracted else "",
+            page_count=extracted.page_count if extracted else None, slide_count=extracted.slide_count if extracted else None,
+            sheet_count=extracted.sheet_count if extracted else None, duration_seconds=extracted.duration_seconds if extracted else None,
+            sequence_hint=index, error_message=extracted_error, metadata_=extracted.metadata if extracted else {},
+        ))
+    import hashlib
+    batch.file_count, batch.supported_count, batch.skipped_count, batch.error_count = len(files), supported, skipped, errors
+    batch.total_size, batch.total_media_seconds = total_size, media_seconds
+    batch.content_hash = hashlib.sha256("".join(hashes).encode()).hexdigest()
+    batch.status = "ready" if supported else "failed"
+    db.commit(); db.refresh(batch)
+    return _batch_payload(batch, db)
+
+
+@router.get("/import/batches/{batch_id}", response_model=ImportBatchOut)
+def get_import_batch(batch_id: int, db: Db):
+    return _batch_payload(get_or_404(db, ImportBatch, batch_id), db)
+
+
+@router.delete("/import/batches/{batch_id}", status_code=204)
+def delete_import_batch(batch_id: int, db: Db):
+    db.delete(get_or_404(db, ImportBatch, batch_id)); db.commit()
+    _remove_upload_cache(batch_id)
+
+
+@router.post("/planning/schedule")
+def create_schedule(data: PlanningOptions, db: Db):
+    try:
+        units, provider, model = analyze_learning_units(db, data)
+        schedule = build_schedule(units, data, provider, model)
+        batch = get_or_404(db, ImportBatch, data.batch_id)
+        batch.status = "planned"; db.commit()
+        return schedule
+    except LLMProviderError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/planning/confirm")
+def confirm_schedule(data: PlanningConfirmRequest, db: Db):
+    batch = get_or_404(db, ImportBatch, data.batch_id)
+    task_list = ParsedList(name=data.schedule.title, description=data.schedule.goal, items=[])
+    for index, day in enumerate(data.schedule.days):
+        children = []
+        for unit in day.units:
+            source_bits = [unit.source_path]
+            if unit.page_from:
+                source_bits.append(f"第 {unit.page_from}～{unit.page_to or unit.page_from} 页")
+            if unit.media_start is not None:
+                source_bits.append(f"{unit.media_start // 60:02d}:{unit.media_start % 60:02d}～{(unit.media_end or 0) // 60:02d}:{(unit.media_end or 0) % 60:02d}")
+            children.append(ParsedItem(
+                title=unit.title, description=unit.summary or " · ".join(source_bits), start_date=day.date,
+                due_date=day.date, estimated_minutes=unit.estimated_minutes, tags=[unit.topic],
+                metadata={"learning_unit_id": unit.id, "source_document_id": unit.document_id,
+                    "source_path": unit.source_path, "page_from": unit.page_from, "page_to": unit.page_to,
+                    "media_start": unit.media_start, "media_end": unit.media_end, "unit_type": unit.unit_type},
+            ))
+        task_list.items.append(ParsedItem(
+            title=f"第 {index + 1} 天：{day.title}", description=f"预计 {day.estimated_minutes} 分钟",
+            start_date=day.date, due_date=day.date, estimated_minutes=day.estimated_minutes,
+            subtasks=children, tags=["智能规划"], metadata={"planned_day": index + 1, "capacity_minutes": day.capacity_minutes},
+        ))
+    parsed = ParsedPlan(
+        title=data.schedule.title, goal=data.schedule.goal, description=f"{data.schedule.day_count} 天智能规划",
+        content_type="scheduled_plan", date=data.schedule.start_date, lists=[task_list], confidence=0.9,
+        parser="planner_v2", provider=data.schedule.provider, model=data.schedule.model, granularity="detailed",
+        task_count=len(task_list.items), step_count=sum(len(item.subtasks) for item in task_list.items),
+        warnings=data.schedule.warnings,
+    )
+    result = confirm_parsed_plan(ImportConfirmRequest(
+        plan=parsed, source_name=f"Directory:{batch.root_name}", raw_content=f"导入批次 {batch.id}",
+        duplicate_strategy=data.duplicate_strategy, external_id=f"import-batch:{batch.id}",
+        source_metadata={"import_batch_id": batch.id, "planner": "v2", "provider": data.schedule.provider, "model": data.schedule.model},
+    ), db)
+    batch.status = "confirmed"; db.commit()
+    return result
+
+
 @router.post("/import/confirm")
 def confirm_import(data: ImportConfirmRequest, db: Db):
     return confirm_parsed_plan(data, db)
@@ -338,17 +699,27 @@ def providers(db: Db):
 
 
 @router.post("/settings/providers", status_code=201)
-def add_provider(data: dict, db: Db):
-    allowed = {k: data[k] for k in ("name", "provider_type", "base_url", "model", "temperature", "timeout", "api_key_env", "enabled") if k in data}
-    if not all(k in allowed for k in ("name", "base_url", "model")): raise HTTPException(422, "name, base_url and model are required")
-    if not str(allowed["base_url"]).startswith(("https://", "http://")): raise HTTPException(422, "base_url must start with http:// or https://")
-    if allowed.get("enabled"):
+def add_provider(data: ProviderCreate, db: Db):
+    duplicate = db.scalar(select(ProviderConfig).where(func.lower(ProviderConfig.name) == data.name.lower()))
+    if duplicate:
+        raise HTTPException(409, f'已存在名为“{duplicate.name}”的 Provider，请直接在上方更新其 API Key 或配置')
+    allowed = data.model_dump(exclude={"api_key"})
+    if data.enabled:
         for configured in db.scalars(select(ProviderConfig).where(ProviderConfig.enabled.is_(True))): configured.enabled = False
-    obj = ProviderConfig(**allowed); db.add(obj); db.flush()
-    api_key = str(data.get("api_key", "")).strip()
-    if api_key: set_secret(provider_secret_name(obj.id), api_key)
-    db.commit(); db.refresh(obj)
-    return {"id": obj.id, **allowed, "has_api_key": bool(api_key or os.getenv(obj.api_key_env))}
+    obj = ProviderConfig(**allowed); db.add(obj)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, f'已存在名为“{data.name}”的 Provider') from exc
+    secret_name = provider_secret_name(obj.id)
+    try:
+        if data.api_key: set_secret(secret_name, data.api_key)
+        db.commit(); db.refresh(obj)
+    except (OSError, RuntimeError) as exc:
+        db.rollback()
+        raise HTTPException(500, f"无法在本机安全保存 API Key：{exc}") from exc
+    return {"id": obj.id, **allowed, "has_api_key": bool(data.api_key or os.getenv(obj.api_key_env))}
 
 
 @router.put("/settings/providers/{provider_id}")
