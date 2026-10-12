@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-set "APP_EXE=%CD%\desktop_dist\2.1.3\AI Checklist Hub\AI Checklist Hub.exe"
+set "APP_EXE=%CD%\desktop_dist\2.2.0\AI Checklist Hub\AI Checklist Hub.exe"
 if not exist "%APP_EXE%" (
   echo Desktop build is missing. Building it now...
   call build-desktop.bat
@@ -24,7 +24,7 @@ if errorlevel 1 goto :error
 
 echo.
 echo Installer built successfully:
-echo %CD%\installer_dist\AI-Checklist-Hub-Setup-2.1.3.exe
+echo %CD%\installer_dist\AI-Checklist-Hub-Setup-2.2.0.exe
 exit /b 0
 
 :error

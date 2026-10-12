@@ -47,7 +47,9 @@ class ItemBase(BaseModel):
     @field_validator("title")
     @classmethod
     def clean_title(cls, value: str) -> str:
-        return value.strip()
+        cleaned=value.strip()
+        if not cleaned:raise ValueError("任务标题不能为空")
+        return cleaned
 
     @field_validator("tags", mode="before")
     @classmethod
@@ -65,7 +67,7 @@ class ItemCreate(ItemBase):
 
 
 class ItemUpdate(BaseModel):
-    title: str | None = None
+    title: str | None = Field(default=None,min_length=1,max_length=500)
     description: str | None = None
     completed: bool | None = None
     list_id: int | None = None
@@ -75,13 +77,19 @@ class ItemUpdate(BaseModel):
     priority: str | None = None
     due_date: DateType | None = None
     start_date: DateType | None = None
-    estimated_minutes: int | None = None
+    estimated_minutes: int | None = Field(default=None,ge=0)
     acceptance_criteria: str | None = None
     notes: str | None = None
     source: str | None = None
     position: int | None = None
     metadata: dict[str, Any] | None = Field(default=None, validation_alias=AliasChoices("metadata_", "metadata"))
     tags: list[str] | None = None
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls,value):
+        if value is None or not value.strip():raise ValueError("任务标题不能为空")
+        return value.strip()
 
     @field_validator("priority", mode="before")
     @classmethod
@@ -165,7 +173,7 @@ class ParsedItem(BaseModel):
     priority: str | None = None
     due_date: DateType | None = None
     start_date: DateType | None = None
-    estimated_minutes: int | None = None
+    estimated_minutes: int | None = Field(default=None,ge=0)
     acceptance_criteria: str | None = None
     notes: str | None = None
     tags: list[str] = Field(default_factory=list)
@@ -197,7 +205,7 @@ class ParsedPlan(BaseModel):
     content_type: str = "generic"
     date: DateType | None = None
     lists: list[ParsedList] = Field(default_factory=list)
-    confidence: float = 0.7
+    confidence: float = Field(default=0.7,ge=0,le=1)
     parser: str = "rule"
     provider: str | None = None
     model: str | None = None

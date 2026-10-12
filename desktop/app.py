@@ -57,6 +57,18 @@ def migrate_legacy_database(target: Path) -> None:
             return
 
 
+def backup_before_upgrade(database: Path, data_dir: Path) -> None:
+    """Keep a native SQLite backup before importing a new backend/schema."""
+    marker = data_dir / "backups" / "before-2.2.0.db"
+    if database.exists() and not marker.exists():
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(database) as source, sqlite3.connect(marker) as target:
+            source.backup(target)
+        os.environ["AI_CHECKLIST_UPGRADE_BACKUP"] = str(marker)
+    elif marker.exists():
+        os.environ["AI_CHECKLIST_UPGRADE_BACKUP"] = str(marker)
+
+
 def reserve_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -86,6 +98,7 @@ def main() -> int:
         data_dir = persistent_data_dir()
         database = data_dir / "checklist.db"
         migrate_legacy_database(database)
+        backup_before_upgrade(database, data_dir)
         os.environ["DATABASE_URL"] = f"sqlite:///{database.as_posix()}"
         os.environ["AI_CHECKLIST_DATA_DIR"] = str(data_dir)
         os.environ["AI_CHECKLIST_DESKTOP"] = "1"

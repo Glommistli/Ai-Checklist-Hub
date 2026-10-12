@@ -1,5 +1,5 @@
 #define MyAppName "AI Checklist Hub"
-#define MyAppVersion "2.1.3"
+#define MyAppVersion "2.2.0"
 #define MyAppPublisher "AI Checklist Hub"
 #define MyAppExeName "AI Checklist Hub.exe"
 
@@ -41,7 +41,7 @@ Name: "chinesesimp"; MessagesFile: "languages\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："; Flags: checkedonce
 
 [Files]
-Source: "..\desktop_dist\2.1.3\AI Checklist Hub\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\desktop_dist\2.2.0\AI Checklist Hub\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"

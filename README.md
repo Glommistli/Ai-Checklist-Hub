@@ -28,6 +28,29 @@ AI Checklist Hub 是一个面向 Windows 的本地任务管理应用。它既可
 - [开发测试与构建](#开发测试与构建)
 - [常见问题](#常见问题)
 
+## 2.2.0：执行、恢复与复盘
+
+本次修改依据 [完整改进目标及验收记录](docs/improvement-targets.md) 实施。
+
+| 入口 | 用途 |
+| --- | --- |
+| 待处理 | 集中查看候选、失败和中断邮件；确认、忽略或重试；查看 Gmail 后台进度，暂停/继续处理 |
+| 今天 / 今日安排 | 查看逾期未完成、今日行动和今天完成的根目标；选择执行日期和每日容量，移动或取消安排，独立保留截止日期 |
+| 来源与成果 | 查看完整来源、原文依据、原邮件和模型；记录成果链接、结果及延期原因 |
+| AI 重新规划 | 先生成差异提议，再选择新增、修改或合并；已完成任务受到保护，手动字段默认保留，可明确允许替换 |
+| 回收站 / 操作记录 | 恢复删除的任务树和清单；撤销任务及清单变更，后续修改冲突时拒绝覆盖 |
+| 周复盘 | 汇总完成的根目标、子任务成果证据及未完成事项；导出 Markdown |
+
+任务行默认展示标题、简短说明、子任务进度和必要期限。子任务支持箭头或键盘展开/收起，选择保存到应用数据，桌面重启后保留。根目标是列表及统计的统一计数单位，子任务单独显示进度，回收站内容不计入活动列表和统计。工时按根目标计算，未给根估算时递归汇总子任务，不重复累计父子工时。
+
+Gmail 自动入库同时要求模型置信度达到阈值和顶层任务有可核对的原文摘录，不人为抬高置信度。失败和超过 10 分钟的中断记录可以恢复，后台最多自动尝试 3 次；模型失败候选可手动重试。已导入/忽略邮件继续由账本去重，暂停时剩余邮件进入持久队列，恢复后继续。待处理页可配置精确邮箱/域名过滤，并查看调用量和服务返回的输入/输出 token；每日默认最多 200 次调用，0 表示不限，不虚构实际账单金额。
+
+重新规划会把完整来源和当前任务进度发送给已启用的模型服务。生成提议不修改任务；应用时检查任务是否已变化，过期提议须重新生成，已应用提议不能重复执行。合并不默认选中，已完成任务和含手动修改或成果记录的任务不会被合并。没有 AI 字段基线的历史任务按手动字段保护。
+
+API 时间戳携带 UTC 时区，界面按本地时间显示；今日统计、额度和周复盘按北京时间日界线计算。邮件相对日期以邮件时间为依据，而不是首次同步时间。空白标题、负工时、已删除清单和跨清单父子关系会被拒绝；重新归属父任务时其子树同步归入对应清单。
+
+桌面首次升级到 2.2.0 会先通过 SQLite 原生备份生成 `%LOCALAPPDATA%\AI Checklist Hub\backups\before-2.2.0.db`，再加载新后端。新表保存操作记录、模型用量及重新规划提议，旧数据保留；Alembic 版本为 `8d4a62c0f719`，也支持桌面自动补建表。数据库不通过 HTTP 导出接口公开。
+
 ## 主要功能
 
 ### 任务与计划
@@ -446,6 +469,10 @@ AI-Checklist-Hub/
 | 清单 | `GET/POST /api/lists`、`PUT/DELETE /api/lists/{id}` |
 | 计划 | `GET/POST /api/plans`、`PUT/DELETE /api/plans/{id}` |
 | 分类与统计 | `GET /api/categories`、`GET /api/stats` |
+| 执行与恢复 | `/api/workspace/daily`、`/capacity`、`/trash`、`/undo`、`/actions`、`/task-folds` |
+| 来源及重新规划 | `/api/workspace/source/{id}`、`/evidence/{id}`、`/replan/{id}`、`/replan/{id}/apply` |
+| 待处理及模型控制 | `/api/workspace/pending`、`/pending/{id}/retry`、`/gmail-job`、`/ai-controls`、`/usage` |
+| 周复盘 | `/api/workspace/review`、`/review/export` |
 | 导入 | `POST /api/import/parse`、`/actors`、`/file`、`/confirm` |
 | 多文件/目录批次 | `POST /api/import/batches`、`GET/DELETE /api/import/batches/{id}` |
 | 强制 LLM 智能规划 | `POST /api/planning/schedule`、`POST /api/planning/confirm` |
@@ -499,7 +526,7 @@ build-desktop.bat
 输出位置：
 
 ```text
-desktop_dist\2.1.3\AI Checklist Hub\AI Checklist Hub.exe
+desktop_dist\2.2.0\AI Checklist Hub\AI Checklist Hub.exe
 ```
 
 ### 构建可安装版本
@@ -513,7 +540,7 @@ build-installer.bat
 脚本会在桌面版产物不存在时先调用 `build-desktop.bat`，随后生成：
 
 ```text
-installer_dist\AI-Checklist-Hub-Setup-2.1.3.exe
+installer_dist\AI-Checklist-Hub-Setup-2.2.0.exe
 ```
 
 安装程序支持简体中文安装向导、开始菜单入口、可选桌面快捷方式以及标准卸载入口。默认采用当前用户安装，不需要管理员权限。升级或卸载只处理程序目录，不会删除 `%LOCALAPPDATA%\AI Checklist Hub` 中的任务数据库和加密设置。
@@ -594,7 +621,7 @@ Parser 应保持领域无关，并返回 `ParsedPlan`、`ParsedList` 和 `Parsed
 <details>
 <summary><strong>修改 Gmail 规则后，怎样重新处理历史邮件？</strong></summary>
 
-正常同步不会重复处理已登记邮件，界面不提供历史邮件的批量重扫。未入库的候选可以使用“AI 处理并转为任务”；模型失败的候选可重试，旧候选会重新读取完整正文后分析。已分析的候选复用缓存结果；已经导入的任务不会因修改模型、过滤规则或粒度设置自动重写。直接修改或删除 Gmail 账本属于维护操作，执行前必须备份数据库。
+正常同步不会重复处理已登记邮件，界面不提供历史邮件的批量重扫。未入库的候选可以使用“AI 处理并转为任务”；失败和中断邮件也可从“待处理”恢复，模型失败的候选可重试，旧候选会重新读取完整正文后分析。已分析的候选复用缓存结果；已经导入的任务不会因修改模型、过滤规则或粒度设置自动重写。直接修改或删除 Gmail 账本属于维护操作，执行前必须备份数据库。
 
 </details>
 

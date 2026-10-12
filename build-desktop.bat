@@ -45,13 +45,13 @@ call .venv\Scripts\python.exe -m PyInstaller ^
   --hidden-import uvicorn.loops.auto ^
   --hidden-import uvicorn.protocols.http.auto ^
   --hidden-import uvicorn.protocols.websockets.auto ^
-  --distpath "desktop_dist\2.1.3" ^
+  --distpath "desktop_dist\2.2.0" ^
   --workpath "build\desktop" ^
   "desktop\app.py"
 if errorlevel 1 goto :error
 echo.
 echo Desktop app built successfully:
-echo %CD%\desktop_dist\2.1.3\AI Checklist Hub\AI Checklist Hub.exe
+echo %CD%\desktop_dist\2.2.0\AI Checklist Hub\AI Checklist Hub.exe
 exit /b 0
 :error
 echo Desktop build failed.

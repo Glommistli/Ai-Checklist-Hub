@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 from html import escape
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
@@ -27,6 +27,8 @@ from app.schemas import (
 from app.services.parser import LLMProviderError, OpenAICompatibleProvider, analyze_actors, parse_content, provider_api_key
 from app.services.agent_parser import AgentOptions
 from app.services.repository import create_item, update_item, delete_item_tree
+from app.services.workflow import active, is_active, soft_delete_list, capture, record_action
+from app.core.utc_json import UTCJSONResponse
 from app.services.importer import confirm_parsed_plan
 from app.services.document_import import (
     MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MEDIA_EXTENSIONS, SUPPORTED_EXTENSIONS,
@@ -40,7 +42,7 @@ from app.services.gmail_service import (
     token_configured,
 )
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api",default_response_class=UTCJSONResponse)
 Db = Annotated[Session, Depends(get_db)]
 
 
@@ -68,7 +70,7 @@ def update_ui_settings(data: UISettings, db: Db):
 
 
 @router.get("/health")
-def health(): return {"status": "ok", "time": datetime.utcnow()}
+def health(): return {"status": "ok", "version":"2.2.0", "time": datetime.utcnow(), "upgrade_backup_created": bool(os.getenv("AI_CHECKLIST_UPGRADE_BACKUP") and Path(os.environ["AI_CHECKLIST_UPGRADE_BACKUP"]).is_file())}
 
 
 @router.get("/integrations/gmail/status")
@@ -155,13 +157,9 @@ def accept_gmail_candidate(candidate_id: int, db: Db):
 @router.post("/integrations/gmail/candidates/{candidate_id}/ignore")
 def ignore_gmail_candidate(candidate_id: int, db: Db):
     candidate = get_or_404(db, EmailIngestion, candidate_id)
-    if candidate.status != "candidate":
-        raise HTTPException(400, "这封邮件已处理")
-    candidate.status = "ignored"
-    candidate.reason = "用户在候选任务中选择忽略"
-    candidate.processed_at = datetime.utcnow()
-    db.commit()
-    return {"ok": True}
+    from app.services.gmail_service import ignore_ingestion
+    try:return ignore_ingestion(db,candidate)
+    except GmailError as exc:raise HTTPException(400,str(exc)) from exc
 
 
 @router.delete("/integrations/gmail")
@@ -179,7 +177,7 @@ def list_items(
 ):
     stmt = (
         select(Item).options(selectinload(Item.tags))
-        .order_by(Item.completed, Item.position, Item.created_at.desc(), Item.id.desc())
+        .where(active(Item)).order_by(Item.completed, Item.position, Item.created_at.desc(), Item.id.desc())
         .offset(offset).limit(limit)
     )
     if completed is not None: stmt = stmt.where(Item.completed == completed)
@@ -219,34 +217,36 @@ def toggle_complete(item_id: int, db: Db):
 
 @router.get("/lists", response_model=list[ListOut])
 def list_lists(db: Db):
-    lists = list(db.scalars(select(Checklist).order_by(Checklist.position, Checklist.created_at)))
+    lists = list(db.scalars(select(Checklist).where(active(Checklist)).order_by(Checklist.position, Checklist.created_at)))
     result = []
     for lst in lists:
         data = ListOut.model_validate(lst)
-        data.item_count = db.scalar(select(func.count(Item.id)).where(Item.list_id == lst.id)) or 0
-        data.pending_count = db.scalar(select(func.count(Item.id)).where(Item.list_id == lst.id, Item.completed.is_(False))) or 0
+        data.item_count = db.scalar(select(func.count(Item.id)).where(Item.list_id == lst.id, Item.parent_id.is_(None), active(Item))) or 0
+        data.pending_count = db.scalar(select(func.count(Item.id)).where(Item.list_id == lst.id, Item.completed.is_(False), Item.parent_id.is_(None), active(Item))) or 0
         result.append(data)
     return result
 
 
 @router.post("/lists", response_model=ListOut, status_code=201)
 def add_list(data: ListCreate, db: Db):
+    before=capture(db)
     obj = Checklist(**data.model_dump(exclude={"metadata"}), metadata_=data.metadata)
-    db.add(obj); db.commit(); db.refresh(obj)
+    db.add(obj); record_action(db,"create_list",before,"创建清单："+obj.name);db.commit(); db.refresh(obj)
     return ListOut.model_validate(obj)
 
 
 @router.put("/lists/{list_id}", response_model=ListOut)
 def edit_list(list_id: int, data: ListUpdate, db: Db):
+    before=capture(db)
     obj = get_or_404(db, Checklist, list_id)
     for k, v in data.model_dump(exclude_unset=True, exclude={"metadata"}).items(): setattr(obj, k, v)
     if data.metadata is not None: obj.metadata_ = data.metadata
-    db.commit(); db.refresh(obj)
+    record_action(db,"edit_list",before,"修改清单："+obj.name);db.commit(); db.refresh(obj)
     return ListOut.model_validate(obj)
 
 
 @router.delete("/lists/{list_id}", status_code=204)
-def delete_list(list_id: int, db: Db): db.delete(get_or_404(db, Checklist, list_id)); db.commit()
+def delete_list(list_id: int, db: Db): soft_delete_list(db,get_or_404(db, Checklist, list_id))
 
 
 @router.get("/plans", response_model=list[PlanOut])
@@ -681,13 +681,15 @@ def webhook_import(data: ImportParseRequest, db: Db, x_webhook_token: str | None
 
 @router.get("/stats")
 def stats(db: Db):
-    today = date.today(); week_end = today + timedelta(days=6-today.weekday())
-    def bucket(start, end):
-        total = db.scalar(select(func.count(Item.id)).where(Item.due_date >= start, Item.due_date <= end)) or 0
-        done = db.scalar(select(func.count(Item.id)).where(Item.due_date >= start, Item.due_date <= end, Item.completed.is_(True))) or 0
-        return {"total": total, "completed": done, "percent": round(done / total * 100) if total else 0}
-    return {"today": bucket(today, today), "week": bucket(today - timedelta(days=today.weekday()), week_end),
-        "all": {"total": db.scalar(select(func.count(Item.id))) or 0, "completed": db.scalar(select(func.count(Item.id)).where(Item.completed.is_(True))) or 0}}
+    today = (datetime.now(UTC) + timedelta(hours=8)).date(); week_start=today-timedelta(days=today.weekday());week_end=week_start+timedelta(days=6)
+    roots=list(db.scalars(select(Item).where(Item.parent_id.is_(None),active(Item))))
+    def bucket(rows):
+        total=len(rows);done=sum(i.completed for i in rows)
+        return {"total":total,"completed":done,"percent":round(done/total*100) if total else 0}
+    def completed_day(i):return (i.completed_at+timedelta(hours=8)).date() if i.completed_at else None
+    today_rows=[i for i in roots if (not i.completed and i.due_date and i.due_date<=today) or (i.metadata_ or {}).get("planned_date")==today.isoformat() or (i.completed and (i.due_date==today or completed_day(i)==today))]
+    week_rows=[i for i in roots if (i.due_date and week_start<=i.due_date<=week_end) or (i.metadata_ or {}).get("planned_date","") and week_start.isoformat()<=(i.metadata_ or {})["planned_date"]<=week_end.isoformat() or (i.completed and completed_day(i) and week_start<=completed_day(i)<=week_end)]
+    return {"today":bucket(today_rows),"week":bucket(week_rows),"all":bucket(roots)}
 
 
 @router.get("/settings/providers")
@@ -751,7 +753,7 @@ def test_provider(provider_id: int, db: Db):
     key = provider_api_key(obj)
     if not key: raise HTTPException(400, "请先输入并保存 API Key")
     try:
-        OpenAICompatibleProvider(obj.base_url, key, obj.model, obj.temperature, obj.timeout).test_connection()
+        OpenAICompatibleProvider(obj.base_url, key, obj.model, obj.temperature, obj.timeout,usage_db=db,provider_name=obj.name).test_connection()
     except httpx.HTTPStatusError as exc:
         raise HTTPException(400, f"服务返回 HTTP {exc.response.status_code}，请检查 API Key、余额、地址和模型名称") from exc
     except httpx.RequestError as exc:

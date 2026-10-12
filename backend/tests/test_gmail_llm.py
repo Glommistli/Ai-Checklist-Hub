@@ -9,8 +9,8 @@ from test_gmail import FakeGmailClient, payload
 def plan(confidence=0.96, empty=False):
     return ParsedPlan(title='完成报名', provider='Test model', model='mock', confidence=confidence,
         lists=[] if empty else [ParsedList(name='邮件任务', items=[
-            ParsedItem(title='准备报名材料', subtasks=[ParsedItem(title='准备证明文件')]),
-            ParsedItem(title='完成报名表', due_date='2026-10-20')])])
+            ParsedItem(title='准备报名材料', source_excerpt='请完成并提交报名材料。', subtasks=[ParsedItem(title='准备证明文件')]),
+            ParsedItem(title='完成报名表', source_excerpt='请完成并提交报名材料。', due_date='2026-10-20')])])
 
 def test_ai_plan_precedes_auto_import_and_keeps_subtasks(db, monkeypatch):
     calls=[]

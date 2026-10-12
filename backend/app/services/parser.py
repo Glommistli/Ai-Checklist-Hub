@@ -13,6 +13,7 @@ from app.schemas import ActorAnalysis, ParsedItem, ParsedList, ParsedPlan
 from .agent_parser import AgentOptions, build_actor_messages, build_agent_messages
 from .granularity import normalize_plan
 from .repository import fingerprint_for
+from .model_calls import model_post
 
 HEADER_RE = re.compile(r"^(?:#{1,6}\s*)?(.{1,80}?)[：:]\s*$")
 BULLET_RE = re.compile(r"^\s*(?:[-*+•○◯☐□]|\d+[.)、])\s*(.+?)\s*$")
@@ -116,31 +117,42 @@ def rule_parse(content: str) -> ParsedPlan:
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, base_url: str, api_key: str, model: str, temperature: float = 0.1, timeout: int = 60):
+    def __init__(self, base_url: str, api_key: str, model: str, temperature: float = 0.1, timeout: int = 60, usage_db: Session | None = None, provider_name: str | None = None):
         self.base_url, self.api_key, self.model = base_url.rstrip("/"), api_key, model
         self.temperature, self.timeout = temperature, timeout
+        self.usage_db,self.provider_name=usage_db,provider_name or base_url
 
     def parse(self, content: str, options: AgentOptions | None = None) -> ParsedPlan:
         options = options or AgentOptions()
         schema = ParsedPlan.model_json_schema()
-        response = httpx.post(
+        response = model_post(self.usage_db,
             f"{self.base_url}/chat/completions",
+            provider=self.provider_name, model=self.model,
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             json={"model": self.model, "temperature": self.temperature,
                 "messages": build_agent_messages(content, schema, options),
                 "response_format": {"type": "json_object"}}, timeout=self.timeout,
         )
         response.raise_for_status()
-        payload = json.loads(response.json()["choices"][0]["message"]["content"])
-        parsed = ParsedPlan.model_validate(payload)
+        try:
+            payload = json.loads(response.json()["choices"][0]["message"]["content"])
+            parsed = ParsedPlan.model_validate(payload)
+        except (ValueError,KeyError,TypeError):
+            if self.usage_db is not None and getattr(response,"extensions",{}).get("workflow_call_id"):
+                from app.models.workflow import ModelCall
+                call=self.usage_db.get(ModelCall,response.extensions["workflow_call_id"])
+                call.status="invalid";self.usage_db.commit()
+            raise
         parsed.parser = "agent_v2"
-        parsed.confidence = max(parsed.confidence, 0.85)
+        if not 0 <= parsed.confidence <= 1:
+            raise ValueError("模型置信度必须在 0 到 1 之间")
         return parsed
 
     def analyze_actors(self, content: str) -> ActorAnalysis:
         schema = ActorAnalysis.model_json_schema()
-        response = httpx.post(
+        response = model_post(self.usage_db,
             f"{self.base_url}/chat/completions",
+            provider=self.provider_name, model=self.model,
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             json={"model": self.model, "temperature": 0,
                 "messages": build_actor_messages(content, schema),
@@ -151,8 +163,9 @@ class OpenAICompatibleProvider:
         return ActorAnalysis.model_validate(payload)
 
     def test_connection(self) -> None:
-        response = httpx.post(
+        response = model_post(self.usage_db,
             f"{self.base_url}/chat/completions",
+            provider=self.provider_name, model=self.model,
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             json={
                 "model": self.model,
@@ -177,7 +190,7 @@ def analyze_actors(content: str, db: Session) -> ActorAnalysis:
         if not key:
             raise LLMProviderError(f"Provider“{config.name}”已启用，但尚未配置 API Key")
         try:
-            analysis = OpenAICompatibleProvider(config.base_url, key, config.model, 0, config.timeout).analyze_actors(content)
+            analysis = OpenAICompatibleProvider(config.base_url, key, config.model, 0, config.timeout,usage_db=db,provider_name=config.name).analyze_actors(content)
             analysis.provider = config.name
             analysis.model = config.model
             return analysis
@@ -191,7 +204,7 @@ def analyze_actors(content: str, db: Session) -> ActorAnalysis:
             raise LLMProviderError(f"{config.name} 返回的责任主体分析无效") from exc
     if settings.openai_api_key:
         try:
-            analysis = OpenAICompatibleProvider(settings.openai_base_url, settings.openai_api_key, settings.openai_model, 0).analyze_actors(content)
+            analysis = OpenAICompatibleProvider(settings.openai_base_url, settings.openai_api_key, settings.openai_model, 0,usage_db=db,provider_name="Default").analyze_actors(content)
             analysis.provider = "Default OpenAI-compatible"
             analysis.model = settings.openai_model
             return analysis
@@ -211,7 +224,7 @@ def _parse_with_llm(content: str, db: Session, options: AgentOptions) -> ParsedP
         if not key:
             raise LLMProviderError(f"Provider“{config.name}”已启用，但尚未配置 API Key")
         try:
-            parsed = OpenAICompatibleProvider(config.base_url, key, config.model, config.temperature, config.timeout).parse(content, options)
+            parsed = OpenAICompatibleProvider(config.base_url, key, config.model, config.temperature, config.timeout,usage_db=db,provider_name=config.name).parse(content, options)
             parsed.provider = config.name
             parsed.model = config.model
             return parsed
@@ -225,7 +238,7 @@ def _parse_with_llm(content: str, db: Session, options: AgentOptions) -> ParsedP
             raise LLMProviderError(f"{config.name} 返回的内容不是有效任务结构") from exc
     if settings.openai_api_key:
         try:
-            parsed = OpenAICompatibleProvider(settings.openai_base_url, settings.openai_api_key, settings.openai_model).parse(content, options)
+            parsed = OpenAICompatibleProvider(settings.openai_base_url, settings.openai_api_key, settings.openai_model,usage_db=db,provider_name="Default").parse(content, options)
             parsed.provider = "Default OpenAI-compatible"
             parsed.model = settings.openai_model
             return parsed

@@ -133,4 +133,4 @@ def mock_model(monkeypatch):
     from app.schemas import ParsedPlan, ParsedList, ParsedItem
     monkeypatch.setattr(gmail_service, "_plan_for_email", lambda db, account, message: ParsedPlan(
         title="邮件报名", parser="gmail_llm", provider="Mock", model="mock", confidence=0.94,
-        lists=[ParsedList(name="邮件任务", items=[ParsedItem(title="提交报名材料")])]))
+        lists=[ParsedList(name="邮件任务", items=[ParsedItem(title="提交报名材料",source_excerpt=message["body"])])]))

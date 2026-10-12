@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from app.api import router
+from app.api.workspace import router as workspace_router
 from app.core.config import settings
 from app.core.database import Base, SessionLocal, engine
 from app.models import Checklist
@@ -25,8 +26,9 @@ async def lifespan(_: FastAPI):
         stop_gmail_worker()
 
 
-app = FastAPI(title=settings.app_name, version="2.1.3", docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version="2.2.0", docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
 app.include_router(router)
+app.include_router(workspace_router)
 
 frontend = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 if frontend.exists():

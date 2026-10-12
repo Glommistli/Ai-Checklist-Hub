@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.models import ImportBatch, ImportDocument, ProviderConfig
 from app.schemas import LearningUnit, LearningUnitSet, PlannedDay, PlanningOptions, SchedulePreview
 from .parser import LLMProviderError, provider_api_key
+from .model_calls import model_post
 
 
 def _provider(db: Session) -> tuple[ProviderConfig | None, str, str, str, float, int]:
@@ -94,8 +95,9 @@ def analyze_learning_units(db: Session, options: PlanningOptions) -> tuple[Learn
     messages = [{"role": "system", "content": system}, {"role": "user", "content": _document_manifest(docs)}]
     base_url = config.base_url if config else settings.openai_base_url
     try:
-        response = httpx.post(
+        response = model_post(db,
             f"{base_url.rstrip('/')}/chat/completions",
+            provider=provider_name, model=model,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={"model": model, "temperature": temperature, "messages": messages, "response_format": {"type": "json_object"}},
             timeout=max(timeout, 90),
