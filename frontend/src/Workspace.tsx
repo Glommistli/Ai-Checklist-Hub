@@ -39,16 +39,16 @@ export function WorkspacePage({view,items,onChanged,notify}:{view:string;items:I
  useEffect(()=>{setError('');void load().catch(e=>setError(errorText(e)))},[view,items,day,week])
  useEffect(()=>{if(view!=='pending'||job.status!=='running')return;const timer=window.setInterval(()=>{void loadPending().catch(e=>setError(errorText(e)))},1500);return()=>clearInterval(timer)},[view,job.status])
  const action=async(fn:()=>Promise<unknown>,message:string)=>{setBusy(true);setError('');try{await fn();await onChanged();await load();notify(message)}catch(e){setError(errorText(e));notify(errorText(e),'error')}finally{setBusy(false)}}
- const titles:Record<string,string>={pending:'待处理',daily:'今日行动安排',review:'周复盘',trash:'回收站',activity:'操作记录'}
+ const titles:Record<string,string>={pending:'待处理邮件',daily:'安排今日',review:'周复盘',trash:'回收站',activity:'操作记录'}
  const rootItems=items.filter(i=>!i.parent_id)
- return <div className="workspace-page"><div className="page-title"><div><p className="eyebrow">执行与回顾</p><h1>{titles[view]}</h1><p>{view==='pending'?'确认邮件任务、恢复失败处理，并控制模型用量。':view==='daily'?'安排什么时候执行，不改变原来的截止日期。':view==='trash'?'删除的任务与清单可以恢复。':view==='activity'?'最近操作可以撤销；发生后续冲突时会保留最新修改。':'积累完成证据，回顾成果和未完成事项。'}</p></div></div>
+ return <div className="workspace-page"><div className="page-title"><div><p className="eyebrow">执行与回顾</p><h1>{titles[view]}</h1><p>{view==='pending'?'接收邮件并确认要加入清单的任务。':view==='daily'?'安排什么时候执行，不改变原来的截止日期。':view==='trash'?'删除的任务与清单可以恢复。':view==='activity'?'最近操作可以撤销；发生后续冲突时会保留最新修改。':'积累完成证据，回顾成果和未完成事项。'}</p></div></div>
  {error&&<div className="notice error">{error}</div>}
  {view==='pending'&&<>
   <section className="workspace-card"><div className="workspace-heading"><h2>邮件处理</h2><span className="workspace-badge">{labels[job.status]||job.status}</span></div><p>{labels[job.stage]||job.stage}{job.total? ` · ${job.processed}/${job.total} 封`:''}{job.subject?' · '+job.subject:''}</p>
-   <progress max={Math.max(1,job.total)} value={job.processed}/>
+   {job.total>0&&<progress max={Math.max(1,job.total)} value={job.processed}/>}
    {job.error&&<p className="workspace-error">{job.error}</p>}
-   <div className="workspace-buttons"><button disabled={busy||job.status==='running'} className="primary" onClick={()=>action(()=>api.post('/api/workspace/gmail-job'),'已启动后台处理')}><RefreshCw/>开始处理</button>
-   <button disabled={busy||job.status!=='running'} className="secondary" onClick={()=>action(()=>api.post('/api/workspace/gmail-job/pause'),'当前请求结束后暂停')}>暂停</button>
+   <div className="workspace-buttons">{job.status!=='paused'&&<button disabled={busy||job.status==='running'} className="primary" onClick={()=>action(()=>api.post('/api/workspace/gmail-job'),'已启动后台处理')}><RefreshCw/>{job.status==='running'?'正在处理…':'接收并处理邮件'}</button>}
+   {job.status==='running'&&<button disabled={busy} className="secondary" onClick={()=>action(()=>api.post('/api/workspace/gmail-job/pause'),'当前请求结束后暂停')}>暂停</button>}
    {job.status==='paused'&&<button disabled={busy} className="secondary" onClick={()=>action(()=>api.post('/api/workspace/gmail-job/resume'),'已恢复处理')}>继续处理</button>}</div></section>
   <section className="workspace-card"><h2>待确认与失败邮件 · {pending.length}</h2>{!pending.length&&<p className="workspace-muted">没有需要处理的邮件。</p>}
    {pending.map(p=><article className="pending-row" key={p.id}><div><strong>{p.preview_title||p.subject||'尚未读取主题'}</strong><p className="workspace-muted">{p.sender} · {labels[p.status]||p.status} · 已尝试 {p.attempt_count} 次 · {timeText(p.received_at)}</p><p>{p.reason}</p>
@@ -57,12 +57,12 @@ export function WorkspacePage({view,items,onChanged,notify}:{view:string;items:I
     {p.status==='candidate'&&<button className="primary" disabled={busy} onClick={()=>action(()=>api.post('/api/integrations/gmail/candidates/'+p.id+'/accept'),'已处理候选邮件')}>确认模型任务</button>}
     <button className="secondary" disabled={busy||job.status==='running'} onClick={()=>action(()=>api.post('/api/workspace/pending/'+p.id+'/retry'),'已重试邮件处理')}>{p.status==='processing'?'恢复处理':'重新分析'}</button>
     <button className="secondary" disabled={busy} onClick={()=>action(()=>api.post('/api/integrations/gmail/candidates/'+p.id+'/ignore'),'已忽略邮件')}>忽略</button></div></div></article>)}</section>
-  <section className="workspace-card"><h2>模型用量与发送者规则</h2>{usage&&<p>今日调用 {usage.calls}{usage.daily_call_limit?' / '+usage.daily_call_limit:''} 次 · 输入 {usage.input_tokens} tokens · 输出 {usage.output_tokens} tokens</p>}
+  <details className="workspace-card processing-rules"><summary>处理规则与模型用量</summary><h2>模型用量与发送者规则</h2>{usage&&<p>今日调用 {usage.calls}{usage.daily_call_limit?' / '+usage.daily_call_limit:''} 次 · 输入 {usage.input_tokens} tokens · 输出 {usage.output_tokens} tokens</p>}
    <div className="workspace-form"><label>每日调用上限（0 表示不限）<input type="number" min={0} max={10000} value={controls.daily_call_limit} onChange={e=>setControls({...controls,daily_call_limit:Number(e.target.value)})}/></label>
    <label>允许的发送者或域名（每行一个；留空接受全部）<textarea rows={2} value={controls.sender_allowlist.join('\n')} onChange={e=>setControls({...controls,sender_allowlist:e.target.value.split('\n')})}/></label>
    <label>排除的发送者或域名（每行一个）<textarea rows={2} value={controls.sender_blocklist.join('\n')} onChange={e=>setControls({...controls,sender_blocklist:e.target.value.split('\n')})}/></label></div>
    <button className="secondary" disabled={busy} onClick={()=>action(()=>api.put('/api/workspace/ai-controls',controls),'已保存处理规则')}>保存规则</button><p className="workspace-muted">规则用于之后处理的邮件；已入库任务不会重新扫描。未配置价格时仅展示调用与 token，不估算费用。</p>
-   {usage&&<details><summary>最近模型请求</summary>{usage.recent.map(r=><p key={r.id}>{r.model} · {labels[r.status]||r.status} · {r.elapsed_ms} ms · {timeText(r.created_at)}</p>)}</details>}</section>
+   {usage&&<details><summary>最近模型请求</summary>{usage.recent.map(r=><p key={r.id}>{r.model} · {labels[r.status]||r.status} · {r.elapsed_ms} ms · {timeText(r.created_at)}</p>)}</details>}</details>
  </>}
  {view==='daily'&&<>
   <section className="workspace-card"><div className="workspace-form"><label>执行日期<input type="date" value={day} onChange={e=>setDay(e.target.value)}/></label><label>每日可用分钟<input type="number" min={15} max={1440} value={capacity} onChange={e=>setCapacity(Number(e.target.value))}/></label></div>

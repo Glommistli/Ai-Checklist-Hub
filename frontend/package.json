@@ -3,7 +3,7 @@
   "private": true,
   "version": "2.2.0",
   "type": "module",
-  "scripts": {"dev": "vite", "build": "tsc -b && vite build", "lint": "tsc --noEmit"},
+  "scripts": {"dev": "vite", "build": "tsc -b && vite build", "lint": "tsc --noEmit", "test:ui": "node qa/navigation.test.mjs"},
   "dependencies": {"@vitejs/plugin-react": "latest", "lucide-react": "latest", "react": "latest", "react-dom": "latest", "vite": "latest"},
   "devDependencies": {"@types/react": "latest", "@types/react-dom": "latest", "typescript": "latest"}
 }
